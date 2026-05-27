@@ -1,104 +1,161 @@
 # src/features/build_features.py
 """Feature engineering for the fraud detection prototype.
 
-* Derives temporal and relational features from the raw synthetic CSV.
-* Generates sentence embeddings for the claim ``descripcion`` column using
-  ``sentence-transformers``.
-* Returns a ``pandas.DataFrame`` ready for model training.
+Loads relational tables (siniestros, polizas, asegurados, proveedores, documentos)
+and derives numeric, temporal, relational and NLP features (using TF-IDF for similarity)
+to be used in the rule engine and the ML model.
 """
 
 import os
 import pandas as pd
-from pathlib import Path
-from datetime import datetime
-
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from pathlib import Path
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Paths (can be overridden via env vars)
+# Paths
 DATA_DIR = os.getenv("DATA_DIR", "data")
 RAW_DIR = os.getenv("RAW_DATA_DIR", os.path.join(DATA_DIR, "raw"))
 PROC_DIR = os.getenv("PROCESSED_DATA_DIR", os.path.join(DATA_DIR, "processed"))
 
-# Ensure processed folder exists
-Path(PROC_DIR).mkdir(parents=True, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Helper: temporal features
-# ---------------------------------------------------------------------------
-def _temporal_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def build_features(save: bool = True) -> pd.DataFrame:
+    """Load raw relational datasets, compute engineered features, and save processed data."""
+    # Ensure processed folder exists
+    Path(PROC_DIR).mkdir(parents=True, exist_ok=True)
+    
+    # 1. Load raw tables
+    siniestros_path = Path(RAW_DIR) / "siniestros.csv"
+    polizas_path = Path(RAW_DIR) / "polizas.csv"
+    asegurados_path = Path(RAW_DIR) / "asegurados.csv"
+    proveedores_path = Path(RAW_DIR) / "proveedores.csv"
+    documentos_path = Path(RAW_DIR) / "documentos.csv"
+    
+    if not all(p.exists() for p in [siniestros_path, polizas_path, asegurados_path, proveedores_path, documentos_path]):
+        raise FileNotFoundError("Relational raw tables are missing. Please run scripts/generate_synthetic.py first.")
+        
+    df_sin = pd.read_csv(siniestros_path)
+    df_pol = pd.read_csv(polizas_path)
+    df_aseg = pd.read_csv(asegurados_path)
+    df_prov = pd.read_csv(proveedores_path)
+    df_docs = pd.read_csv(documentos_path)
+    
     # Ensure dates are datetime objects
-    df["fecha_ocurrencia"] = pd.to_datetime(df["fecha_ocurrencia"], errors="coerce")
-    df["fecha_reporte"] = pd.to_datetime(df["fecha_reporte"], errors="coerce")
-    # Days between occurrence and report
-    df["dias_entre_ocurrencia_reporte"] = (
-        df["fecha_reporte"] - df["fecha_ocurrencia"]).dt.days
-    # Age of policy at the time of claim (already present, but keep for safety)
-    df["dias_desde_inicio_poliza"] = pd.to_numeric(df["dias_desde_inicio_poliza"], errors="coerce")
-    df["dias_desde_fin_poliza"] = pd.to_numeric(df["dias_desde_fin_poliza"], errors="coerce")
-    return df
-
-# ---------------------------------------------------------------------------
-# Helper: numeric feature scaling / simple aggregates
-# ---------------------------------------------------------------------------
-def _numeric_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Ratio of claimed amount to estimated amount (avoid division by zero)
-    df["ratio_monto"] = df["monto_reclamado"] / df["monto_estimado"].replace(0, np.nan)
-    df["ratio_monto"] = df["ratio_monto"].fillna(0)
-    # Frequency of claims for the same insured (historical count)
-    df["freq_asegurado"] = df.groupby("id_asegurado")["id_siniestro"].transform("count")
-    # Frequency of claims for same provider (beneficiario)
-    df["freq_beneficiario"] = df.groupby("beneficiario")["id_siniestro"].transform("count")
-    return df
-
-# ---------------------------------------------------------------------------
-# Helper: text embeddings for the free‑text description
-# ---------------------------------------------------------------------------
-def _embedding_features(df: pd.DataFrame, model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> pd.DataFrame:
-    df = df.copy()
-    model = SentenceTransformer(model_name)
-    # Compute embeddings – we store them as a list of floats (could be persisted as .npy)
-    embeddings = model.encode(df["descripcion"].astype(str).tolist(), show_progress_bar=False)
-    # Expand to separate columns (e.g., embed_0 … embed_383 for MiniLM-L6-v2 which has 384 dims)
-    embed_dim = embeddings.shape[1]
-    embed_cols = [f"embed_{i}" for i in range(embed_dim)]
-    embed_df = pd.DataFrame(embeddings, columns=embed_cols)
-    df = pd.concat([df.reset_index(drop=True), embed_df], axis=1)
-    return df
-
-# ---------------------------------------------------------------------------
-# Public function
-# ---------------------------------------------------------------------------
-def build_features(df: pd.DataFrame, save: bool = True) -> pd.DataFrame:
-    """Run the full feature engineering pipeline.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Raw data (as returned by ``src.ingestion.load_data.load_siniestros``).
-    save : bool, default True
-        If True, the processed dataframe is written to ``data/processed`` as
-        ``features.csv``.
-    """
-    # 1️⃣ Temporal features
-    df = _temporal_features(df)
-    # 2️⃣ Numeric / aggregate features
-    df = _numeric_features(df)
-    # 3️⃣ Text embeddings (NLP)
-    df = _embedding_features(df)
-
+    df_sin["fecha_ocurrencia"] = pd.to_datetime(df_sin["fecha_ocurrencia"])
+    df_sin["fecha_reporte"] = pd.to_datetime(df_sin["fecha_reporte"])
+    df_pol["fecha_inicio"] = pd.to_datetime(df_pol["fecha_inicio"])
+    df_pol["fecha_fin"] = pd.to_datetime(df_pol["fecha_fin"])
+    
+    # 2. Relational mappings & lookup features
+    # Match suma_asegurada from policies
+    pol_dict = df_pol.set_index("id_poliza")["suma_asegurada"].to_dict()
+    df_sin["suma_asegurada"] = df_sin["id_poliza"].map(pol_dict)
+    
+    # Match provider info
+    prov_restrict_dict = df_prov.set_index("id_proveedor")["porcentaje_de_casos_observados"].to_dict()
+    prov_name_dict = df_prov.set_index("id_proveedor")["nombre"].to_dict()
+    
+    # Blacklisted providers
+    blacklist = ["Taller El Chueco", "Taller XYZ", "Clínica Trucha", "Perito Sospechoso"]
+    df_sin["proveedor_lista_restrictiva"] = df_sin["beneficiario"].apply(
+        lambda x: 1 if any(b in str(x) for b in blacklist) else 0
+    )
+    
+    # 3. Document check features (from documentos table)
+    # Check if any document has an inconsistency
+    inc_docs = df_docs[df_docs["inconsistencia_detectada"] == "Sí"]["id_siniestro"].unique()
+    df_sin["documento_alterado"] = df_sin["id_siniestro"].apply(lambda x: 1 if x in inc_docs else 0)
+    
+    # Check if a critical document is missing (delivered == "No" and documents_completos == "No")
+    df_sin["falta_documento_obligatorio"] = df_sin["documentos_completos"].apply(lambda x: 1 if str(x).lower() == "no" else 0)
+    
+    # 4. Frequencies in rolling 18 months (540 days)
+    # For each claim, we count claims of the same entity within [occurrence_date - 540 days, occurrence_date]
+    freq_aseg_18m = []
+    freq_veh_18m = []
+    
+    for idx, row in df_sin.iterrows():
+        aseg_id = row["id_asegurado"]
+        placa = row["placa_vehiculo"]
+        date = row["fecha_ocurrencia"]
+        
+        # Insured
+        claims_aseg = df_sin[
+            (df_sin["id_asegurado"] == aseg_id) & 
+            (df_sin["fecha_ocurrencia"] <= date) & 
+            (df_sin["fecha_ocurrencia"] >= date - pd.Timedelta(days=540))
+        ]
+        freq_aseg_18m.append(len(claims_aseg))
+        
+        # Vehicle
+        if pd.notna(placa):
+            claims_veh = df_sin[
+                (df_sin["placa_vehiculo"] == placa) & 
+                (df_sin["fecha_ocurrencia"] <= date) & 
+                (df_sin["fecha_ocurrencia"] >= date - pd.Timedelta(days=540))
+            ]
+            freq_veh_18m.append(len(claims_veh))
+        else:
+            freq_veh_18m.append(1)
+            
+    df_sin["freq_asegurado_18m"] = freq_aseg_18m
+    df_sin["freq_vehiculo_18m"] = freq_veh_18m
+    df_sin["freq_conductor_18m"] = freq_aseg_18m # Conductor is usually the insured
+    
+    # Freq of previous RC (Responsabilidad Civil) claims for the same insured
+    # We count previous claims where cobertura is "Choque" (which represents RC claims here)
+    freq_rc_prev = []
+    for idx, row in df_sin.iterrows():
+        aseg_id = row["id_asegurado"]
+        date = row["fecha_ocurrencia"]
+        claims_rc = df_sin[
+            (df_sin["id_asegurado"] == aseg_id) & 
+            (df_sin["fecha_ocurrencia"] < date) & 
+            (df_sin["cobertura"] == "Choque")
+        ]
+        freq_rc_prev.append(len(claims_rc))
+    df_sin["freq_solo_rc_previos"] = freq_rc_prev
+    
+    # 5. Provider cases in the same year
+    df_sin["anio_siniestro"] = df_sin["fecha_ocurrencia"].dt.year
+    df_sin["proveedor_casos_observados_anio"] = df_sin.groupby(["id_proveedor", "anio_siniestro"])["id_siniestro"].transform("count")
+    
+    # 6. Dynamic / Narrative features (NLP)
+    desc_lower = df_sin["descripcion"].astype(str).str.lower()
+    df_sin["relato_ilogico"] = desc_lower.apply(
+        lambda x: 1 if any(kw in x for kw in ["volcadura", "desplome", "imposible", "inconsistente"]) else 0
+    )
+    df_sin["accidente_madrugada"] = desc_lower.apply(
+        lambda x: 1 if any(kw in x for kw in ["madrugada", "01:", "02:", "03:", "04:", "05:"]) else 0
+    )
+    df_sin["tercero_huye_sin_camaras"] = desc_lower.apply(
+        lambda x: 1 if ("huye" in x or "huyó" in x or "se dio a la fuga" in x) and ("cámara" not in x and "camara" not in x) else 0
+    )
+    
+    # 7. Text Similarity between all narratives (RF07 cloned narratives)
+    # Using TF-IDF Vectorizer (scikit-learn is already installed, avoids sentence-transformers weight)
+    vectorizer = TfidfVectorizer(stop_words=None)
+    tfidf_matrix = vectorizer.fit_transform(df_sin["descripcion"].astype(str))
+    sim_matrix = cosine_similarity(tfidf_matrix)
+    
+    max_sims = []
+    for i in range(len(df_sin)):
+        sim_scores = sim_matrix[i].copy()
+        sim_scores[i] = 0 # Ignore self-similarity
+        max_sims.append(sim_scores.max())
+        
+    df_sin["narrativa_similitud_score"] = max_sims
+    df_sin["narrativa_clonada"] = df_sin["narrativa_similitud_score"].apply(lambda x: 1 if x >= 0.85 else 0)
+    
+    # 8. Monto cercano a suma asegurada (>= 95%)
+    df_sin["monto_cercano_suma_asegurada"] = (df_sin["monto_reclamado"] >= 0.95 * df_sin["suma_asegurada"]).astype(int)
+    
+    # Save processed dataframe
     if save:
-        out_path = Path(PROC_DIR) / "features.csv"
-        df.to_csv(out_path, index=False)
-        print(f"Features saved to {out_path}")
-    return df
+        out_path = Path(PROC_DIR) / "siniestros_processed.csv"
+        df_sin.to_csv(out_path, index=False)
+        print(f"Processed features saved to: {out_path}")
+        
+    return df_sin
 
-# ---------------------------------------------------------------------------
-# If executed as a script (useful for quick local testing)
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    from src.ingestion.load_data import load_siniestros
-    raw_df = load_siniestros()
-    build_features(raw_df)
+    build_features()

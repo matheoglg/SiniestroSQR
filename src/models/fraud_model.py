@@ -1,80 +1,128 @@
+# src/models/fraud_model.py
+"""Script to train and persist the Machine Learning fraud classification model.
+
+Uses RandomForestClassifier from Scikit-Learn to learn patterns of fraud.
+Calculates performance metrics (Precision, Recall, F1, AUC) and saves the model to models/.
+"""
+
 import os
+# pyrefly: ignore [missing-import]
 import joblib
 import pandas as pd
+import numpy as np
 from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
 
-from sklearn.ensemble import IsolationForest
-from xgboost import XGBClassifier
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
+MODEL_DIR = PROJECT_ROOT / "models"
 
-# Paths (adjust if needed)
-RAW_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "raw"
-PROCESSED_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "processed"
-MODEL_DIR = Path(__file__).resolve().parents[3] / "models"
+# Features selected for model training
+FEATURES = [
+    "monto_reclamado",
+    "monto_estimado",
+    "dias_desde_inicio_poliza",
+    "dias_desde_fin_poliza",
+    "dias_entre_ocurrencia_reporte",
+    "historial_siniestros_asegurado",
+    "freq_asegurado_18m",
+    "freq_vehiculo_18m",
+    "freq_conductor_18m",
+    "freq_solo_rc_previos",
+    "proveedor_lista_restrictiva",
+    "proveedor_casos_observados_anio",
+    "documento_alterado",
+    "falta_documento_obligatorio",
+    "relato_ilogico",
+    "accidente_madrugada",
+    "tercero_huye_sin_camaras",
+    "narrativa_similitud_score",
+    "narrativa_clonada",
+    "monto_cercano_suma_asegurada"
+]
 
 def load_data() -> pd.DataFrame:
-    """Load the processed dataset used for training.
-    Expected file: `processed/siniestros_processed.csv`.
-    """
+    """Load the processed dataset containing engineered features."""
     csv_path = PROCESSED_DATA_DIR / "siniestros_processed.csv"
     if not csv_path.exists():
-        raise FileNotFoundError(f"Processed data not found at {csv_path}")
+        raise FileNotFoundError(f"Processed features file not found at: {csv_path}. Run build_features first.")
     return pd.read_csv(csv_path)
 
-def train_isolation_forest(df: pd.DataFrame, contamination: float = 0.05):
-    """Train an IsolationForest on the numeric features.
-    Returns the fitted model and the anomaly scores.
-    """
-    numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns
-    X = df[numeric_cols]
-    model = IsolationForest(contamination=contamination, random_state=42)
-    model.fit(X)
-    scores = -model.decision_function(X)  # higher = more anomalous
-    return model, scores
-
-def train_xgboost(df: pd.DataFrame, target: str = "etiqueta_fraude_simulada"):
-    """Train an XGBoost classifier for the binary fraud label.
-    Returns the fitted model.
-    """
-    if target not in df.columns:
-        raise ValueError(f"Target column '{target}' not found in data")
-    X = df.drop(columns=[target])
-    y = df[target]
-    # Simple preprocessing: fill NaNs with median for numeric columns
-    X = X.fillna(X.median())
-    model = XGBClassifier(
-        n_estimators=200,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        objective="binary:logistic",
-        eval_metric="logloss",
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X, y)
-    return model
-
-def save_model(model, model_name: str):
-    """Persist a trained model using joblib.
-    """
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = MODEL_DIR / f"{model_name}.joblib"
-    joblib.dump(model, model_path)
-    print(f"Model saved to {model_path}")
-
-def main():
+def train_model():
+    """Train, evaluate and save the fraud model."""
     df = load_data()
-    # Train Isolation Forest
-    iso_model, iso_scores = train_isolation_forest(df)
-    save_model(iso_model, "isolation_forest")
-    # Train XGBoost
-    xgb_model = train_xgboost(df)
-    save_model(xgb_model, "xgboost_fraud")
-    # Optionally, store anomaly scores for later use
-    scores_path = PROCESSED_DATA_DIR / "iso_scores.csv"
-    pd.DataFrame({"id_siniestro": df["id_siniestro"], "anomaly_score": iso_scores}).to_csv(scores_path, index=False)
-    print(f"Anomaly scores saved to {scores_path}")
+    
+    # Target label
+    target = "etiqueta_fraude_simulada"
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not found in the dataset.")
+        
+    # Prepare X and y
+    # Ensure all required features are present
+    missing_features = [f for f in FEATURES if f not in df.columns]
+    if missing_features:
+        raise ValueError(f"Features missing from processed data: {missing_features}")
+        
+    X = df[FEATURES].fillna(0)
+    y = df[target]
+    
+    # Train-Test Split for evaluation
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    
+    print(f"Training set size: {X_train.shape[0]} samples")
+    print(f"Testing set size: {X_test.shape[0]} samples")
+    print(f"Fraud prevalence in train: {y_train.mean():.2%}, test: {y_test.mean():.2%}")
+    
+    # Initialize Random Forest classifier
+    model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        random_state=42,
+        class_weight="balanced", # Handle class imbalance if any
+        n_jobs=-1
+    )
+    
+    # Fit model on training set
+    model.fit(X_train, y_train)
+    
+    # Evaluate
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+    
+    print("\n--- Model Evaluation ---")
+    print(classification_report(y_test, y_pred))
+    
+    auc = roc_auc_score(y_test, y_prob)
+    print(f"ROC-AUC Score: {auc:.4f}")
+    
+    cm = confusion_matrix(y_test, y_pred)
+    print("Confusion Matrix:")
+    print(cm)
+    
+    # Fit model on full dataset for production/deployment
+    print("\nFitting model on the entire dataset...")
+    final_model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        random_state=42,
+        class_weight="balanced",
+        n_jobs=-1
+    )
+    final_model.fit(X, y)
+    
+    # Save the model
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = MODEL_DIR / "random_forest_fraud.joblib"
+    joblib.dump(final_model, model_path)
+    
+    # Save feature list to ensure consistency in predictions
+    feature_path = MODEL_DIR / "features.joblib"
+    joblib.dump(FEATURES, feature_path)
+    
+    print(f"Trained model saved to: {model_path}")
+    print(f"Features list saved to: {feature_path}")
 
 if __name__ == "__main__":
-    main()
+    train_model()

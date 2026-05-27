@@ -1,26 +1,70 @@
 # src/ingestion/load_data.py
-"""Utility to load synthetic CSVs produced by ``scripts/generate_synthetic.py``.
+"""Utilities to load raw or processed CSV datasets.
 
-The function returns a pandas.DataFrame ready for further processing.
+Provides functions to load Siniestros, Pólizas, Asegurados, Proveedores, and Documentos.
 """
 
 import os
+# pyrefly: ignore [missing-import]
 import pandas as pd
+from pathlib import Path
 
-DATA_DIR = os.getenv("DATA_DIR", "data")
-RAW_DIR = os.getenv("RAW_DATA_DIR", os.path.join(DATA_DIR, "raw"))
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
+PROC_DIR = PROJECT_ROOT / "data" / "processed"
 
+def _get_dir(processed: bool) -> Path:
+    return PROC_DIR if processed else RAW_DIR
 
-def load_siniestros(csv_name: str = "siniestros.csv") -> pd.DataFrame:
-    """Load a CSV file from the ``raw`` data directory.
+def load_siniestros(processed: bool = False) -> pd.DataFrame:
+    """Load the Siniestros dataset."""
+    path = _get_dir(processed) / "siniestros.csv"
+    if not path.exists():
+        # Try processed features path if it's processed
+        if processed:
+            path = PROC_DIR / "siniestros_processed.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"Claims data file not found at: {path}")
+            
+    df = pd.read_csv(path)
+    # Parse dates if they exist
+    for col in ["fecha_ocurrencia", "fecha_reporte"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
 
-    Parameters
-    ----------
-    csv_name: str
-        Name of the CSV file (default ``siniestros.csv``).
-    """
-    path = os.path.join(RAW_DIR, csv_name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Synthetic data file not found: {path}")
-    df = pd.read_csv(path, parse_dates=["fecha_ocurrencia", "fecha_reporte"], infer_datetime_format=True)
+def load_polizas(processed: bool = False) -> pd.DataFrame:
+    """Load the Pólizas dataset."""
+    path = _get_dir(processed) / "polizas.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Policies data file not found at: {path}")
+    df = pd.read_csv(path)
+    for col in ["fecha_inicio", "fecha_fin"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+def load_asegurados(processed: bool = False) -> pd.DataFrame:
+    """Load the Asegurados dataset."""
+    path = _get_dir(processed) / "asegurados.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Insureds data file not found at: {path}")
+    return pd.read_csv(path)
+
+def load_proveedores(processed: bool = False) -> pd.DataFrame:
+    """Load the Proveedores dataset."""
+    path = _get_dir(processed) / "proveedores.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Providers data file not found at: {path}")
+    return pd.read_csv(path)
+
+def load_documentos(processed: bool = False) -> pd.DataFrame:
+    """Load the Documentos dataset."""
+    path = _get_dir(processed) / "documentos.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Documents data file not found at: {path}")
+    df = pd.read_csv(path)
+    if "fecha_emision" in df.columns:
+        df["fecha_emision"] = pd.to_datetime(df["fecha_emision"], errors="coerce")
     return df
